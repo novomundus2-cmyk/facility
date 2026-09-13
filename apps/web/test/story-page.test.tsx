@@ -301,4 +301,36 @@ describe("story overview integration", () => {
     expect(root.querySelector("#story-composer")).toBeNull();
     expect(root.querySelector('button[aria-expanded="false"]')?.textContent).toBe("send a task");
   });
+
+  it("shows browser-test evidence even when the story has only two workspace artifacts", async () => {
+    setUp();
+    mocks.bundle.artifacts = [
+      {
+        id: "shot",
+        kind: "screenshot",
+        label: "Browser screenshot",
+        uri: "workspace://ws/shot.png",
+      },
+      { id: "trace", kind: "trace", label: "Browser trace", uri: "workspace://ws/trace.zip" },
+    ];
+
+    const { root } = await render();
+    expect(root.querySelector('a[href="#results"]')?.textContent).toContain("all 2 results");
+    expect(root.querySelector("#results")?.textContent).toContain("Browser screenshot");
+    expect(root.querySelector("#results")?.textContent).toContain("Browser trace");
+    expect(root.querySelector('a[href^="workspace:"]')).toBeNull();
+  });
+
+  it("keeps the results link valid when web links and workspace artifacts are mixed", async () => {
+    setUp();
+    mocks.bundle.artifacts = [
+      { id: "report", kind: "report", label: "Test report", uri: "https://example.com/report" },
+      { id: "trace", kind: "trace", label: "Browser trace", uri: "workspace://ws/trace.zip" },
+    ];
+
+    const { root } = await render();
+    expect(root.querySelector('a[href="https://example.com/report"]')).not.toBeNull();
+    expect(root.querySelector('a[href="#results"]')).not.toBeNull();
+    expect(root.querySelector("#results")?.textContent).toContain("Browser trace");
+  });
 });

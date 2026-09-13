@@ -312,7 +312,8 @@ export default async function StoryPage({
         </details>
       ) : null}
 
-      {bundle.artifacts.length > 3 ? (
+      {bundle.artifacts.length > 3 ||
+      bundle.artifacts.some((artifact) => !safeExternalUrl(artifact.uri)) ? (
         <section id="results" className="scroll-mt-6 flex flex-col gap-3">
           <Eyebrow>results · {bundle.artifacts.length}</Eyebrow>
           <div className="flex flex-col border border-(--line)">

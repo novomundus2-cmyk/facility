@@ -105,7 +105,7 @@ export function StoryActions({
           computeState={computeState}
         />
       </section>
-      {results.length > 0 ? (
+      {artifacts.length > 0 ? (
         <p className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[12px] text-(--mut)">
           <span>Results:</span>
           {results.map((artifact) => (

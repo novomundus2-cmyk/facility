@@ -59,19 +59,47 @@ export async function beginIdempotentRequest(
     reply.header("idempotency-status", "created");
     return;
   }
+  return processExistingIdempotencyRecord(db, id, principal.orgId, request, reply, requestHash);
+}
+
+async function processExistingIdempotencyRecord(
+  db: FacilityDb,
+  id: string,
+  orgId: string,
+  request: FastifyRequest,
+  reply: FastifyReply,
+  requestHash: string,
+  retryCount = 0,
+): Promise<void> {
+  const maxRetries = 3;
   const existing = (
     await db
       .select()
       .from(idempotencyRecords)
-      .where(and(eq(idempotencyRecords.id, id), eq(idempotencyRecords.orgId, principal.orgId)))
+      .where(and(eq(idempotencyRecords.id, id), eq(idempotencyRecords.orgId, orgId)))
       .limit(1)
   )[0];
   if (!existing) {
     throw new ApiError(409, "idempotency_conflict", "Idempotency request conflicted");
   }
   if (existing.expiresAt <= new Date()) {
+    if (retryCount >= maxRetries) {
+      throw new ApiError(
+        500,
+        "idempotency_retry_limit",
+        "Failed to process idempotency record after multiple retries",
+      );
+    }
     await db.delete(idempotencyRecords).where(eq(idempotencyRecords.id, id));
-    return beginIdempotentRequest(db, request, reply);
+    return processExistingIdempotencyRecord(
+      db,
+      id,
+      orgId,
+      request,
+      reply,
+      requestHash,
+      retryCount + 1,
+    );
   }
   if (existing.requestHash !== requestHash) {
     throw new ApiError(
@@ -87,13 +115,30 @@ export async function beginIdempotentRequest(
       .where(
         and(
           eq(idempotencyRecords.id, id),
-          eq(idempotencyRecords.orgId, principal.orgId),
+          eq(idempotencyRecords.orgId, orgId),
           eq(idempotencyRecords.state, "pending"),
           lt(idempotencyRecords.updatedAt, staleBefore),
         ),
       )
       .returning({ id: idempotencyRecords.id });
-    if (reclaimed.length > 0) return beginIdempotentRequest(db, request, reply);
+    if (reclaimed.length > 0) {
+      if (retryCount >= maxRetries) {
+        throw new ApiError(
+          500,
+          "idempotency_retry_limit",
+          "Failed to process idempotency record after multiple retries",
+        );
+      }
+      return processExistingIdempotencyRecord(
+        db,
+        id,
+        orgId,
+        request,
+        reply,
+        requestHash,
+        retryCount + 1,
+      );
+    }
     reply.header("retry-after", "1");
     throw new ApiError(
       409,

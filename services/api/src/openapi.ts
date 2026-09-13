@@ -25,4 +25,4 @@ document.servers = [
 await mkdir(dirname(out), { recursive: true });
 await writeFile(out, `${JSON.stringify(document, null, 2)}\n`);
 await app.close();
-console.log(`wrote ${out}`);
+process.stdout.write(`wrote ${out}\n`);

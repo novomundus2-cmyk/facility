@@ -20,6 +20,7 @@ import type {
   WorkspaceRuntime,
 } from "./runtime.js";
 
+// Primitive schemas - reusable building blocks
 const RepositoryName = z
   .string()
   .min(3)
@@ -34,6 +35,10 @@ const RepositoryName = z
     return `${match[1]}/${match[2]}`;
   });
 
+const EnvironmentName = z.string().regex(/^[A-Z][A-Z0-9_]{0,127}$/);
+const ServiceName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/);
+
+// Component schemas - domain objects
 const ServiceSchema = z
   .object({
     port: z.number().int().min(1).max(65_535),
@@ -42,31 +47,34 @@ const ServiceSchema = z
   })
   .strict();
 
-const EnvironmentName = z.string().regex(/^[A-Z][A-Z0-9_]{0,127}$/);
+const RepositoriesSchema = z
+  .object({
+    primary: RepositoryName,
+    related: z.array(RepositoryName).default([]),
+  })
+  .strict();
 
+const EnvironmentSchema = z
+  .object({
+    image: z.string().min(1).max(500).optional(),
+    setup: z.string().min(1).max(4_000).optional(),
+    start: z.string().min(1).max(4_000),
+    ready: z.string().min(1).max(4_000).optional(),
+    stop: z.string().min(1).max(4_000).optional(),
+    seed: z.string().min(1).max(4_000).optional(),
+    browser_test: z.string().min(1).max(4_000).optional(),
+    secrets: z.array(EnvironmentName).default([]),
+    variables: z.array(EnvironmentName).default([]),
+    services: z.record(ServiceName, ServiceSchema).default({}),
+  })
+  .strict();
+
+// Main schema - composed from components
 export const ProjectManifestSchema = z
   .object({
     version: z.literal(1).default(1),
-    repositories: z
-      .object({
-        primary: RepositoryName,
-        related: z.array(RepositoryName).default([]),
-      })
-      .strict(),
-    environment: z
-      .object({
-        image: z.string().min(1).max(500).optional(),
-        setup: z.string().min(1).max(4_000).optional(),
-        start: z.string().min(1).max(4_000),
-        ready: z.string().min(1).max(4_000).optional(),
-        stop: z.string().min(1).max(4_000).optional(),
-        seed: z.string().min(1).max(4_000).optional(),
-        browser_test: z.string().min(1).max(4_000).optional(),
-        secrets: z.array(EnvironmentName).default([]),
-        variables: z.array(EnvironmentName).default([]),
-        services: z.record(z.string().regex(/^[a-z][a-z0-9-]{0,62}$/), ServiceSchema).default({}),
-      })
-      .strict(),
+    repositories: RepositoriesSchema,
+    environment: EnvironmentSchema,
   })
   .strict();
 

@@ -17,26 +17,22 @@ import {
 } from "./runtime.js";
 
 const SESSION_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
-// The command API has a five-hour ceiling even for a 24-hour persistent session.
 const MAX_COMMAND_TIMEOUT_MS = 5 * 60 * 60 * 1_000;
+const MAX_RETRY_ATTEMPTS = 10;
+const RETRY_TIMEOUT_MS = 30_000;
 
-export class VercelWorkspaceRuntime implements WorkspaceRuntime {
-  readonly provider = "vercel" as const;
-
+/**
+ * Manages sandbox lifecycle operations (create, get, lifecycle)
+ */
+class VercelSandboxManager {
   constructor(
     private readonly credentials?: { token: string; teamId: string; projectId: string },
   ) {}
 
-  async create(input: CreateWorkspace): Promise<WorkspaceHandle> {
-    assertWorkspaceId(input.id);
+  async getOrCreate(input: CreateWorkspace, onStarted?: () => Promise<void>) {
     const ports = validateWorkspacePorts(input.ports);
     const gatewayPorts = previewGatewayPorts(ports);
-    const bootstrapCommand = workspaceBootstrapCommand(input);
-    let startedCompute = false;
-    const onStarted = async () => {
-      startedCompute = true;
-    };
-    const sandbox = await Sandbox.getOrCreate({
+    return Sandbox.getOrCreate({
       ...this.credentials,
       name: input.id,
       onCreate: onStarted,
@@ -52,41 +48,53 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       tags: { facility: "workspace" },
       resume: true,
     });
-    return this.initializeAndHandle(sandbox, input, bootstrapCommand, () => startedCompute);
   }
 
-  async wake(workspace: WorkspaceLocator): Promise<WorkspaceHandle> {
-    const bootstrapCommand = workspaceBootstrapCommand(workspace);
-    let startedCompute = false;
-    const sandbox = await this.get(workspace, true, async () => {
-      startedCompute = true;
-    });
-    return this.initializeAndHandle(sandbox, workspace, bootstrapCommand, () => startedCompute);
-  }
-
-  async exec(
+  async get(
     workspace: WorkspaceLocator,
-    command: WorkspaceCommand,
-  ): Promise<WorkspaceCommandResult> {
+    resume: boolean,
+    onResume?: (sandbox: Sandbox) => Promise<void>,
+  ) {
+    assertWorkspaceId(workspace.id);
+    if (workspace.externalRef !== workspace.id) {
+      throw new WorkspaceRuntimeError(
+        "workspace_reference_invalid",
+        "Vercel workspace reference does not match its Facility identity",
+      );
+    }
+    return Sandbox.get({
+      ...this.credentials,
+      name: workspace.externalRef,
+      resume,
+      ...(onResume ? { onResume } : {}),
+    });
+  }
+
+  handleToWorkspaceHandle(input: CreateWorkspace, sandbox: Sandbox): WorkspaceHandle {
+    return {
+      ...input,
+      provider: "vercel" as const,
+      externalRef: sandbox.name,
+      volumeRef: sandbox.currentSnapshotId ?? `vercel:${sandbox.name}`,
+      computeRef: sandbox.currentSession().sessionId,
+      state: sandbox.status === "running" ? "running" : "sleeping",
+    };
+  }
+}
+
+/**
+ * Executes workspace commands with bounded retry logic
+ */
+class VercelCommandExecutor {
+  async execute(sandbox: Sandbox, command: WorkspaceCommand): Promise<WorkspaceCommandResult> {
     if (command.stdin !== undefined) {
       throw new WorkspaceRuntimeError(
         "workspace_stdin_unsupported",
         "Vercel workspace commands do not support stdin; pass data as an argument or file",
       );
     }
-    const sandbox = await this.get(workspace, true);
-    const stdoutStream = new PassThrough();
-    const stderrStream = new PassThrough();
-    const stdout: Buffer[] = [];
-    const stderr: Buffer[] = [];
-    stdoutStream.on("data", (chunk: Buffer) => {
-      stdout.push(chunk);
-      command.onOutput?.({ stream: "stdout", data: chunk.toString("utf8") });
-    });
-    stderrStream.on("data", (chunk: Buffer) => {
-      stderr.push(chunk);
-      command.onOutput?.({ stream: "stderr", data: chunk.toString("utf8") });
-    });
+
+    const { stdoutStream, stderrStream, stdout, stderr } = this.createStreams(command);
     const running = await sandbox.asUser("node").runCommand({
       cmd: command.command,
       args: command.args,
@@ -98,45 +106,65 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
           : Math.min(command.timeoutMs, MAX_COMMAND_TIMEOUT_MS),
       detached: true,
     });
+
+    return this.monitorExecution(running, command, stdoutStream, stderrStream, stdout, stderr);
+  }
+
+  private createStreams(
+    command: WorkspaceCommand,
+  ): {
+    stdoutStream: PassThrough;
+    stderrStream: PassThrough;
+    stdout: Buffer[];
+    stderr: Buffer[];
+  } {
+    const stdoutStream = new PassThrough();
+    const stderrStream = new PassThrough();
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+
+    stdoutStream.on("data", (chunk: Buffer) => {
+      stdout.push(chunk);
+      command.onOutput?.({ stream: "stdout", data: chunk.toString("utf8") });
+    });
+    stderrStream.on("data", (chunk: Buffer) => {
+      stderr.push(chunk);
+      command.onOutput?.({ stream: "stderr", data: chunk.toString("utf8") });
+    });
+
+    return { stdoutStream, stderrStream, stdout, stderr };
+  }
+
+  private async monitorExecution(
+    running: Awaited<ReturnType<Sandbox["asUser"]>["runCommand"]>,
+    command: WorkspaceCommand,
+    stdoutStream: PassThrough,
+    stderrStream: PassThrough,
+    stdout: Buffer[],
+    stderr: Buffer[],
+  ): Promise<WorkspaceCommandResult> {
     const observation = new AbortController();
     let canceled = command.signal?.aborted ?? false;
+
     const cancel = () => {
       canceled = true;
       observation.abort();
       void running.kill("SIGTERM").catch(() => undefined);
     };
+
     command.signal?.addEventListener("abort", cancel, { once: true });
     if (canceled) cancel();
+
     const logs = (async () => {
       for await (const log of running.logs({ signal: observation.signal })) {
         if (log.stream === "stdout") stdoutStream.write(log.data);
         else stderrStream.write(log.data);
       }
     })();
-    const completion = (async () => {
-      // Metadata reads do not reliably include an exit status. Bound each wait
-      // on this original command so no HTTP request lasts for the whole agent run.
-      const maxRetries = 10;
-      let retries = 0;
-      while (retries < maxRetries) {
-        const timeout = AbortSignal.timeout(30_000);
-        try {
-          return await running.wait({
-            signal: AbortSignal.any([observation.signal, timeout]),
-          });
-        } catch (error) {
-          if (timeout.aborted && !observation.signal.aborted) {
-            retries++;
-            continue;
-          }
-          throw error;
-        }
-      }
-      throw new Error(
-        `Command wait exceeded maximum retries (${maxRetries}); command may be hung`,
-      );
-    })();
-    let result: Awaited<typeof completion>;
+
+    const completion = this.waitForCompletion(running, observation);
+
+    let result: Awaited<ReturnType<typeof this.waitForCompletion>>;
     try {
       [result] = await Promise.all([completion, logs]);
       if (canceled) throw new Error("command canceled");
@@ -154,6 +182,7 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
       stdoutStream.end();
       stderrStream.end();
     }
+
     return {
       exitCode: result.exitCode,
       stdout: Buffer.concat(stdout).toString("utf8"),
@@ -162,14 +191,83 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
     };
   }
 
+  private async waitForCompletion(
+    running: Awaited<ReturnType<Sandbox["asUser"]>["runCommand"]>,
+    observation: AbortController,
+  ) {
+    let retries = 0;
+    while (retries < MAX_RETRY_ATTEMPTS) {
+      const timeout = AbortSignal.timeout(RETRY_TIMEOUT_MS);
+      try {
+        return await running.wait({
+          signal: AbortSignal.any([observation.signal, timeout]),
+        });
+      } catch (error) {
+        if (timeout.aborted && !observation.signal.aborted) {
+          retries++;
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error(
+      `Command wait exceeded maximum retries (${MAX_RETRY_ATTEMPTS}); command may be hung`,
+    );
+  }
+}
+
+/**
+ * Main Vercel workspace runtime implementation
+ */
+export class VercelWorkspaceRuntime implements WorkspaceRuntime {
+  readonly provider = "vercel" as const;
+
+  private readonly sandboxManager: VercelSandboxManager;
+  private readonly commandExecutor: VercelCommandExecutor;
+
+  constructor(
+    private readonly credentials?: { token: string; teamId: string; projectId: string },
+  ) {
+    this.sandboxManager = new VercelSandboxManager(credentials);
+    this.commandExecutor = new VercelCommandExecutor();
+  }
+
+  async create(input: CreateWorkspace): Promise<WorkspaceHandle> {
+    assertWorkspaceId(input.id);
+    let startedCompute = false;
+    const onStarted = async () => {
+      startedCompute = true;
+    };
+    const sandbox = await this.sandboxManager.getOrCreate(input, onStarted);
+    const bootstrapCommand = workspaceBootstrapCommand(input);
+    return this.initializeAndHandle(sandbox, input, bootstrapCommand, () => startedCompute);
+  }
+
+  async wake(workspace: WorkspaceLocator): Promise<WorkspaceHandle> {
+    let startedCompute = false;
+    const sandbox = await this.sandboxManager.get(workspace, true, async () => {
+      startedCompute = true;
+    });
+    const bootstrapCommand = workspaceBootstrapCommand(workspace);
+    return this.initializeAndHandle(sandbox, workspace, bootstrapCommand, () => startedCompute);
+  }
+
+  async exec(
+    workspace: WorkspaceLocator,
+    command: WorkspaceCommand,
+  ): Promise<WorkspaceCommandResult> {
+    const sandbox = await this.sandboxManager.get(workspace, true);
+    return this.commandExecutor.execute(sandbox, command);
+  }
+
   async expose(workspace: WorkspaceLocator, ports: CreateWorkspace["ports"] = []) {
-    const sandbox = await this.get(workspace, true);
-    return this.endpoints(sandbox, validateWorkspacePorts(ports));
+    const sandbox = await this.sandboxManager.get(workspace, true);
+    return this.getEndpoints(sandbox, validateWorkspacePorts(ports));
   }
 
   async inspect(workspace: WorkspaceLocator): Promise<WorkspaceInspection> {
     try {
-      const sandbox = await this.get(workspace, false);
+      const sandbox = await this.sandboxManager.get(workspace, false);
       return {
         id: workspace.id,
         provider: this.provider,
@@ -177,7 +275,7 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
         computeRef: sandbox.status === "running" ? sandbox.currentSession().sessionId : undefined,
         volumeRef: sandbox.currentSnapshotId ?? workspace.volumeRef,
         endpoints:
-          sandbox.status === "running" ? this.endpoints(sandbox, workspace.ports ?? []) : [],
+          sandbox.status === "running" ? this.getEndpoints(sandbox, workspace.ports ?? []) : [],
         usage: {
           activeCpuMs: sandbox.totalActiveCpuDurationMs,
           durationMs: sandbox.totalDurationMs,
@@ -201,7 +299,7 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
 
   async suspend(workspace: WorkspaceLocator): Promise<void> {
     try {
-      const sandbox = await this.get(workspace, false);
+      const sandbox = await this.sandboxManager.get(workspace, false);
       if (sandbox.status !== "stopped") await sandbox.stop();
     } catch (error) {
       if (!isVercelNotFound(error)) throw error;
@@ -210,42 +308,11 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
 
   async destroy(workspace: WorkspaceLocator): Promise<void> {
     try {
-      const sandbox = await this.get(workspace, false);
+      const sandbox = await this.sandboxManager.get(workspace, false);
       await sandbox.delete();
     } catch (error) {
       if (!isVercelNotFound(error)) throw error;
     }
-  }
-
-  private get(
-    workspace: WorkspaceLocator,
-    resume: boolean,
-    onResume?: (sandbox: Sandbox) => Promise<void>,
-  ) {
-    assertWorkspaceId(workspace.id);
-    if (workspace.externalRef !== workspace.id) {
-      throw new WorkspaceRuntimeError(
-        "workspace_reference_invalid",
-        "Vercel workspace reference does not match its Facility identity",
-      );
-    }
-    return Sandbox.get({
-      ...this.credentials,
-      name: workspace.externalRef,
-      resume,
-      ...(onResume ? { onResume } : {}),
-    });
-  }
-
-  private handle(input: CreateWorkspace, sandbox: Sandbox): WorkspaceHandle {
-    return {
-      ...input,
-      provider: this.provider,
-      externalRef: sandbox.name,
-      volumeRef: sandbox.currentSnapshotId ?? `vercel:${sandbox.name}`,
-      computeRef: sandbox.currentSession().sessionId,
-      state: sandbox.status === "running" ? "running" : "sleeping",
-    };
   }
 
   private async initializeAndHandle(
@@ -260,7 +327,7 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
         bootstrapCommand,
         input.environment?.FACILITY_PREVIEW_GATEWAY_TOKEN,
       );
-      return this.handle(input, sandbox);
+      return this.sandboxManager.handleToWorkspaceHandle(input, sandbox);
     } catch (initializationError) {
       // Preview and restore may wake an already-running workspace. Leave its active turn alone.
       if (!startedCompute()) throw initializationError;
@@ -278,7 +345,7 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
     }
   }
 
-  private endpoints(sandbox: Sandbox, ports: CreateWorkspace["ports"] = []): PreviewEndpoint[] {
+  private getEndpoints(sandbox: Sandbox, ports: CreateWorkspace["ports"] = []): PreviewEndpoint[] {
     const gatewayPorts = previewGatewayPorts(ports);
     return gatewayPorts.map(({ port, gatewayPort }) => ({
       ...port,

@@ -115,7 +115,7 @@ export async function startWorker() {
   await boss.schedule("github.mirror", "*/10 * * * *", {});
   logger.info({ queues }, "facility worker started");
   boss.on("stopped", () => void client.end());
-  return boss;
+  return { boss, logger };
 }
 
 /** Titles whose job was lost (restart, crash) are queued again; generation itself stays idempotent. */
@@ -199,23 +199,24 @@ export async function recoverInterruptedTurns(
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   try {
-    const boss = await startWorker();
+    const { boss, logger } = await startWorker();
     let closing = false;
     const shutdown = async (signal: NodeJS.Signals) => {
       if (closing) return;
       closing = true;
-      console.info(`facility worker received ${signal}; finishing active jobs`);
+      logger.info({ signal }, "facility worker received signal; finishing active jobs");
       try {
         await boss.stop({ graceful: true, timeout: 30_000, close: true });
       } catch (error) {
-        console.error("facility worker shutdown failed", error);
+        logger.error({ err: error }, "facility worker shutdown failed");
         process.exitCode = 1;
       }
     };
     process.once("SIGTERM", () => void shutdown("SIGTERM"));
     process.once("SIGINT", () => void shutdown("SIGINT"));
   } catch (error) {
-    console.error(error);
+    const logger = pino();
+    logger.error({ err: error }, "facility worker startup failed");
     process.exitCode = 1;
   }
 }

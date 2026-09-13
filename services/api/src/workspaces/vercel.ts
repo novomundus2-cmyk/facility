@@ -116,17 +116,25 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
     const completion = (async () => {
       // Metadata reads do not reliably include an exit status. Bound each wait
       // on this original command so no HTTP request lasts for the whole agent run.
-      while (true) {
+      const maxRetries = 10;
+      let retries = 0;
+      while (retries < maxRetries) {
         const timeout = AbortSignal.timeout(30_000);
         try {
           return await running.wait({
             signal: AbortSignal.any([observation.signal, timeout]),
           });
         } catch (error) {
-          if (timeout.aborted && !observation.signal.aborted) continue;
+          if (timeout.aborted && !observation.signal.aborted) {
+            retries++;
+            continue;
+          }
           throw error;
         }
       }
+      throw new Error(
+        `Command wait exceeded maximum retries (${maxRetries}); command may be hung`,
+      );
     })();
     let result: Awaited<typeof completion>;
     try {

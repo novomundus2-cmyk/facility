@@ -201,6 +201,47 @@ describe("Idempotency Security", () => {
     expect(refreshed[0]?.expiresAt.getTime()).toBeGreaterThan(now.getTime());
   });
 
+  it("does not expose an absent record while concurrent requests reclaim an expired key", async () => {
+    const key = "idem-expired-concurrent-key-12345";
+    const path = "/v1/org";
+    const payload = { settings: { theme: "dark" } };
+    const keyHash = hash(key);
+    const requestHash = hash(JSON.stringify(payload));
+    const recordId = `idem_${hash(`${orgId}:user:${userId}:PATCH:${path}:${keyHash}`)}`;
+    await db.insert(idempotencyRecords).values({
+      id: recordId,
+      orgId,
+      principalId: `user:${userId}`,
+      method: "PATCH",
+      path,
+      keyHash,
+      requestHash,
+      state: "completed",
+      statusCode: 200,
+      responseBody: { success: true },
+      expiresAt: new Date(Date.now() - 60_000),
+    });
+
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        app.inject({
+          method: "PATCH",
+          url: path,
+          headers: { Cookie: sessionCookie, "idempotency-key": key },
+          payload,
+        }),
+      ),
+    );
+
+    expect(responses.some((response) => response.statusCode === 200)).toBe(true);
+    expect(responses.every((response) => [200, 409].includes(response.statusCode))).toBe(true);
+    expect(
+      responses
+        .filter((response) => response.statusCode === 409)
+        .map((response) => JSON.parse(response.body).error.code),
+    ).not.toContain("idempotency_conflict");
+  });
+
   it("prevents unauthorized access to protected endpoints without idempotency", async () => {
     const response = await app.inject({
       method: "PATCH",

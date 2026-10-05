@@ -36,14 +36,14 @@ async function canConnect() {
   }
 }
 
-function sandboxFixture(name: string) {
+function sandboxFixture(name: string, failNextInitialization = true) {
   const sandbox = {
     name,
     status: "running",
     currentSnapshotId: "snap_original",
     currentSession: () => ({ sessionId: `session_${name}` }),
     files: new Map([[".facility/plan.md", "Keep this plan across failed starts"]]),
-    failNextInitialization: true,
+    failNextInitialization,
     failStop: false,
     asUser: (_username: string) => ({ runCommand: sandbox.runCommand }),
     runCommand: vi.fn(async () => {
@@ -162,6 +162,108 @@ Implement and verify the plan.
       workspace: { image: "facility-runner:test", ports: [] },
     };
   }
+
+  it("denies malformed preview credentials before creating a provider workspace", async () => {
+    const request = {
+      ...input(`issue:${randomUUID()}`),
+      workspace: {
+        image: "facility-runner:test",
+        environment: { FACILITY_PREVIEW_GATEWAY_TOKEN: "malformed" },
+        ports: [{ service: "web", port: 3000 }],
+      },
+    };
+
+    await expect(service.start(request)).rejects.toMatchObject({
+      code: "workspace_start_failed",
+      cause: { code: "preview_gateway_token_missing" },
+    });
+
+    expect(sandboxApi.getOrCreate).not.toHaveBeenCalled();
+    expect(sandboxApi.get).not.toHaveBeenCalled();
+    const story = (
+      await db.select().from(stories).where(eq(stories.externalId, request.externalId)).limit(1)
+    )[0];
+    if (!story) throw new Error("expected the failed story intent to be retained");
+    const bundle = await service.get(orgId, projectId, story.id);
+    expect(bundle.workspace).toMatchObject({ state: "error", externalRef: null });
+    expect(await db.select().from(turns).where(eq(turns.storyId, story.id))).toHaveLength(0);
+    expect(
+      await db.select().from(storyMessages).where(eq(storyMessages.storyId, story.id)),
+    ).toHaveLength(0);
+    expect(dispatched).not.toHaveBeenCalled();
+  });
+
+  it("denies a wake with a missing preview credential before provider and turn side effects", async () => {
+    const request = input(`issue:${randomUUID()}`);
+    sandboxApi.getOrCreate.mockImplementationOnce(
+      async ({ name, onCreate }: { name: string; onCreate?: () => Promise<void> }) => {
+        const sandbox = sandboxFixture(name, false);
+        sandboxes.set(name, sandbox);
+        await onCreate?.();
+        return sandbox;
+      },
+    );
+    const started = await service.start(request);
+    const workspace = started.workspace;
+    if (!workspace) throw new Error("expected a created workspace");
+    const row = (
+      await db.select().from(workspaces).where(eq(workspaces.id, workspace.id)).limit(1)
+    )[0];
+    if (!row) throw new Error("expected the workspace row to be persisted");
+    const configuration = row.environment as {
+      image: string;
+      variables: Record<string, string>;
+      ports: Array<{ service: string; port: number }>;
+      resources: { cpu: number; memoryMb: number };
+    };
+    const variables = Object.fromEntries(
+      Object.entries(configuration.variables).filter(
+        ([name]) => name !== "FACILITY_PREVIEW_GATEWAY_TOKEN",
+      ),
+    );
+    await db
+      .update(workspaces)
+      .set({
+        state: "sleeping",
+        environment: {
+          ...configuration,
+          variables,
+          ports: [{ service: "web", port: 3000 }],
+        },
+      })
+      .where(eq(workspaces.id, workspace.id));
+    sandboxApi.get.mockClear();
+    sandboxApi.getOrCreate.mockClear();
+    dispatched.mockClear();
+    const turnsBeforeWake = await db
+      .select()
+      .from(turns)
+      .where(eq(turns.storyId, started.story.id));
+    const messagesBeforeWake = await db
+      .select()
+      .from(storyMessages)
+      .where(eq(storyMessages.storyId, started.story.id));
+
+    await expect(
+      service.start({ ...request, messageDedupeKey: `${request.messageDedupeKey}:wake` }),
+    ).rejects.toMatchObject({
+      code: "workspace_start_failed",
+      cause: { code: "preview_gateway_token_missing" },
+    });
+
+    expect(sandboxApi.get).not.toHaveBeenCalled();
+    expect(sandboxApi.getOrCreate).not.toHaveBeenCalled();
+    expect(await db.select().from(turns).where(eq(turns.storyId, started.story.id))).toHaveLength(
+      turnsBeforeWake.length,
+    );
+    expect(
+      await db.select().from(storyMessages).where(eq(storyMessages.storyId, started.story.id)),
+    ).toHaveLength(messagesBeforeWake.length);
+    expect(dispatched).not.toHaveBeenCalled();
+    expect(await db.select().from(workspaces).where(eq(workspaces.id, workspace.id))).toHaveLength(
+      1,
+    );
+  });
 
   async function failedBundle(externalId: string) {
     const story = (

@@ -91,8 +91,16 @@ async function processExistingIdempotencyRecord(
       );
     }
     const now = new Date();
-    const deleted = await db
-      .delete(idempotencyRecords)
+    const reclaimed = await db
+      .update(idempotencyRecords)
+      .set({
+        requestHash,
+        state: "pending",
+        statusCode: null,
+        responseBody: null,
+        expiresAt: new Date(now.getTime() + IDEMPOTENCY_TTL_MS),
+        updatedAt: now,
+      })
       .where(
         and(
           eq(idempotencyRecords.id, id),
@@ -101,7 +109,7 @@ async function processExistingIdempotencyRecord(
         ),
       )
       .returning({ id: idempotencyRecords.id });
-    if (deleted.length === 0) {
+    if (reclaimed.length === 0) {
       return processExistingIdempotencyRecord(
         db,
         id,
@@ -112,34 +120,9 @@ async function processExistingIdempotencyRecord(
         retryCount + 1,
       );
     }
-    const inserted = await db
-      .insert(idempotencyRecords)
-      .values({
-        id,
-        orgId,
-        principalId: existing.principalId,
-        method: existing.method,
-        path: existing.path,
-        keyHash: existing.keyHash,
-        requestHash,
-        expiresAt: new Date(now.getTime() + IDEMPOTENCY_TTL_MS),
-      })
-      .onConflictDoNothing()
-      .returning({ id: idempotencyRecords.id });
-    if (inserted.length > 0) {
-      request.idempotencyId = id;
-      reply.header("idempotency-status", "created");
-      return;
-    }
-    return processExistingIdempotencyRecord(
-      db,
-      id,
-      orgId,
-      request,
-      reply,
-      requestHash,
-      retryCount + 1,
-    );
+    request.idempotencyId = id;
+    reply.header("idempotency-status", "created");
+    return;
   }
   if (existing.requestHash !== requestHash) {
     throw new ApiError(

@@ -1,15 +1,16 @@
+import { createHash } from "node:crypto";
 import { newId } from "@facility/core";
 import {
   createDb,
+  type FacilityDb,
   idempotencyRecords,
   migrate,
   orgMembers,
+  orgs,
   seed,
   users,
-  type FacilityDb,
 } from "@facility/db";
-import { and, eq } from "drizzle-orm";
-import postgres from "postgres";
+import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp, mintSessionCookie } from "../src/app.js";
 import type { AppConfig } from "../src/types.js";
@@ -19,7 +20,7 @@ const databaseUrl =
 const masterKey = Buffer.alloc(32, 7).toString("base64");
 
 let db: FacilityDb;
-let sql: postgres.Sql<any>;
+let client: ReturnType<typeof createDb>["client"];
 let app: Awaited<ReturnType<typeof buildApp>>;
 let orgId: string;
 let userId: string;
@@ -40,35 +41,41 @@ const baseConfig: AppConfig = {
 
 beforeAll(async () => {
   await migrate(databaseUrl);
-  const { db: createdDb, client } = createDb(databaseUrl);
+  await seed(databaseUrl);
+  const connection = createDb(databaseUrl);
+  const { db: createdDb } = connection;
   db = createdDb;
-  sql = postgres(databaseUrl);
+  client = connection.client;
   app = await buildApp(baseConfig);
   await app.ready();
 
-  // Create test user and org
-  const created = await db
-    .insert(users)
-    .values({ id: newId("user"), displayName: "Test User" })
-    .returning({ id: users.id });
-  userId = created[0].id;
+  userId = newId("user");
+  orgId = newId("org");
+  const suffix = userId.slice(-12);
+  await db.insert(orgs).values({
+    id: orgId,
+    name: "Security Test Organization",
+    slug: `security-test-${suffix}`,
+    settings: {},
+  });
+  await db.insert(users).values({
+    id: userId,
+    email: `security-test-${suffix}@example.com`,
+    name: "Test User",
+  });
+  await db.insert(orgMembers).values({
+    id: newId("member"),
+    orgId,
+    userId,
+    roleId: "role_bundled_owner",
+  });
 
-  const createdOrg = await db
-    .insert(orgMembers)
-    .values({
-      orgId: newId("org"),
-      memberId: userId,
-      role: "admin",
-    })
-    .returning({ orgId: orgMembers.orgId });
-  orgId = createdOrg[0].orgId;
-
-  sessionCookie = await mintSessionCookie(userId, masterKey);
+  sessionCookie = `facility_session=${await mintSessionCookie(baseConfig, userId, orgId)}`;
 });
 
 afterAll(async () => {
   await app.close();
-  await sql.end();
+  await client.end();
 });
 
 beforeEach(async () => {
@@ -80,25 +87,24 @@ describe("Idempotency Security", () => {
   it("requires authentication for idempotent requests", async () => {
     const response = await app.inject({
       method: "POST",
-      url: "/api/v1/projects",
+      url: "/v1/projects",
       headers: {
         "idempotency-key": "test-key-12345678",
       },
       payload: { name: "Test Project" },
     });
-    // 401 if no auth, or 404/405 if auth not required for that endpoint
-    expect([401, 404, 405]).toContain(response.statusCode);
+    expect(response.statusCode).toBe(401);
   });
 
   it("rejects idempotency keys shorter than 8 characters", async () => {
     const response = await app.inject({
       method: "POST",
-      url: "/api/v1/projects",
+      url: "/v1/projects",
       headers: {
         Cookie: sessionCookie,
         "idempotency-key": "short",
       },
-      payload: { name: "Test Project" },
+      payload: { name: "Test Project", slug: "test-project-short-key" },
     });
     expect(response.statusCode).toBe(400);
     const body = JSON.parse(response.body);
@@ -110,12 +116,12 @@ describe("Idempotency Security", () => {
     const longKey = "a".repeat(201);
     const response = await app.inject({
       method: "POST",
-      url: "/api/v1/projects",
+      url: "/v1/projects",
       headers: {
         Cookie: sessionCookie,
         "idempotency-key": longKey,
       },
-      payload: { name: "Test Project" },
+      payload: { name: "Test Project", slug: "test-project-long-key" },
     });
     expect(response.statusCode).toBe(400);
     const body = JSON.parse(response.body);
@@ -127,46 +133,48 @@ describe("Idempotency Security", () => {
     // First request
     const response1 = await app.inject({
       method: "PATCH",
-      url: `/api/v1/org/${orgId}/settings`,
+      url: "/v1/org",
       headers: {
         Cookie: sessionCookie,
         "idempotency-key": key,
       },
-      payload: { theme: "dark" },
+      payload: { settings: { theme: "dark" } },
     });
 
-    if (response1.statusCode === 200 || response1.statusCode === 201) {
-      // Second request with same key but different body
-      const response2 = await app.inject({
-        method: "PATCH",
-        url: `/api/v1/org/${orgId}/settings`,
-        headers: {
-          Cookie: sessionCookie,
-          "idempotency-key": key,
-        },
-        payload: { theme: "light" },
-      });
+    expect(response1.statusCode).toBe(200);
+    const response2 = await app.inject({
+      method: "PATCH",
+      url: "/v1/org",
+      headers: {
+        Cookie: sessionCookie,
+        "idempotency-key": key,
+      },
+      payload: { settings: { theme: "light" } },
+    });
 
-      expect(response2.statusCode).toBe(409);
-      const body = JSON.parse(response2.body);
-      expect(body.error.code).toBe("idempotency_key_reused");
-    }
+    expect(response2.statusCode).toBe(409);
+    const body = JSON.parse(response2.body);
+    expect(body.error.code).toBe("idempotency_key_reused");
   });
 
-  it("limits recursive retries in idempotency processing", async () => {
-    const key = "idem-recursion-limit-key-12345";
-    // Insert a stale expired record to trigger retry logic
+  it("reclaims expired idempotency records before replay processing", async () => {
+    const key = "idem-expired-record-key-12345";
+    const path = "/v1/org";
+    const payload = { settings: { theme: "dark" } };
+    const keyHash = hash(key);
+    const requestHash = hash(JSON.stringify(payload));
+    const recordId = `idem_${hash(`${orgId}:user:${userId}:PATCH:${path}:${keyHash}`)}`;
     const now = new Date();
-    const expiredTime = new Date(now.getTime() - 25 * 60 * 60 * 1000); // 25 hours ago
+    const expiredTime = new Date(now.getTime() - 25 * 60 * 60 * 1000);
 
     await db.insert(idempotencyRecords).values({
-      id: `idem_test_${newId("id")}`,
+      id: recordId,
       orgId,
       principalId: `user:${userId}`,
       method: "PATCH",
-      path: `/api/v1/org/${orgId}/settings`,
-      keyHash: "hash1",
-      requestHash: "hash2",
+      path,
+      keyHash,
+      requestHash,
       state: "completed",
       statusCode: 200,
       responseBody: { success: true },
@@ -175,23 +183,29 @@ describe("Idempotency Security", () => {
 
     const response = await app.inject({
       method: "PATCH",
-      url: `/api/v1/org/${orgId}/settings`,
+      url: path,
       headers: {
         Cookie: sessionCookie,
         "idempotency-key": key,
       },
-      payload: { theme: "dark" },
+      payload,
     });
 
-    // Should succeed or return proper error, not hang/timeout
-    expect([200, 201, 400, 409, 500]).toContain(response.statusCode);
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["idempotency-status"]).toBe("created");
+    const refreshed = await db
+      .select()
+      .from(idempotencyRecords)
+      .where(eq(idempotencyRecords.id, recordId));
+    expect(refreshed[0]?.state).toBe("completed");
+    expect(refreshed[0]?.expiresAt.getTime()).toBeGreaterThan(now.getTime());
   });
 
   it("prevents unauthorized access to protected endpoints without idempotency", async () => {
     const response = await app.inject({
-      method: "DELETE",
-      url: `/api/v1/org/${orgId}`,
-      // Missing sessionCookie
+      method: "PATCH",
+      url: "/v1/org",
+      payload: { settings: { theme: "dark" } },
     });
 
     expect(response.statusCode).toBe(401);
@@ -201,12 +215,15 @@ describe("Idempotency Security", () => {
     const maliciousKey = `12345678'; DROP TABLE users; --`;
     const response = await app.inject({
       method: "POST",
-      url: "/api/v1/projects",
+      url: "/v1/projects",
       headers: {
         Cookie: sessionCookie,
         "idempotency-key": maliciousKey,
       },
-      payload: { name: "Test Project" },
+      payload: {
+        name: "Test Project",
+        slug: `test-project-${Date.now()}`,
+      },
     });
 
     // Should handle gracefully, not execute injection
@@ -220,21 +237,33 @@ describe("Idempotency Security", () => {
     const key = "idem-isolation-test-1234567";
     // Create second org
     const org2Id = newId("org");
-    await db.insert(orgMembers).values({
-      orgId: org2Id,
-      memberId: userId,
-      role: "admin",
+    await db.insert(orgs).values({
+      id: org2Id,
+      name: "Second Security Test Organization",
+      slug: `security-test-${org2Id.slice(-12)}`,
+      settings: {},
     });
+    await db.insert(orgMembers).values({
+      id: newId("member"),
+      orgId: org2Id,
+      userId,
+      roleId: "role_bundled_owner",
+    });
+    const org2Cookie = `facility_session=${await mintSessionCookie(baseConfig, userId, org2Id)}`;
 
     // Insert idempotency record for first org
+    const keyHash = hash(key);
+    const requestHash = hash(JSON.stringify({ settings: { theme: "light" } }));
+    const path = "/v1/org";
+    const recordId = `idem_${hash(`${orgId}:user:${userId}:PATCH:${path}:${keyHash}`)}`;
     await db.insert(idempotencyRecords).values({
-      id: `idem_org1_${newId("id")}`,
+      id: recordId,
       orgId,
       principalId: `user:${userId}`,
       method: "PATCH",
-      path: `/api/v1/org/${orgId}/settings`,
-      keyHash: "hash_org1",
-      requestHash: "hash_body_org1",
+      path,
+      keyHash,
+      requestHash,
       state: "completed",
       statusCode: 200,
       responseBody: { success: true },
@@ -244,50 +273,52 @@ describe("Idempotency Security", () => {
     // Same key for second org should be treated separately
     const response = await app.inject({
       method: "PATCH",
-      url: `/api/v1/org/${org2Id}/settings`,
+      url: path,
       headers: {
-        Cookie: sessionCookie,
+        Cookie: org2Cookie,
         "idempotency-key": key,
       },
-      payload: { theme: "light" },
+      payload: { settings: { theme: "light" } },
     });
 
     // Should not conflict with first org's record
-    expect([200, 201, 400, 404]).toContain(response.statusCode);
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["idempotency-status"]).toBe("created");
   });
 
   it("returns consistent replay status headers", async () => {
     const key = "idem-replay-status-test-1234567";
+    const payload = { name: "Replay Test Project", slug: `replay-test-${Date.now()}` };
     // First request
     const response1 = await app.inject({
       method: "POST",
-      url: "/api/v1/projects",
+      url: "/v1/projects",
       headers: {
         Cookie: sessionCookie,
         "idempotency-key": key,
       },
-      payload: { name: "Test Project" },
+      payload,
     });
 
     const status1 = response1.headers["idempotency-status"];
-    if (status1) {
-      expect(["created", "pending"]).toContain(status1);
-    }
+    expect(status1).toBe("created");
 
     // Subsequent request with same key
     const response2 = await app.inject({
       method: "POST",
-      url: "/api/v1/projects",
+      url: "/v1/projects",
       headers: {
         Cookie: sessionCookie,
         "idempotency-key": key,
       },
-      payload: { name: "Test Project" },
+      payload,
     });
 
     const status2 = response2.headers["idempotency-status"];
-    if (status2) {
-      expect(["replayed", "in-progress"]).toContain(status2);
-    }
+    expect(status2).toBe("replayed");
   });
 });
+
+function hash(value: string) {
+  return createHash("sha256").update(value).digest("hex");
+}

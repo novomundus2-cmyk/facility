@@ -1,5 +1,5 @@
 import { PassThrough } from "node:stream";
-import { Sandbox } from "@vercel/sandbox";
+import { type Command, Sandbox } from "@vercel/sandbox";
 import {
   assertWorkspaceId,
   type CreateWorkspace,
@@ -110,9 +110,7 @@ class VercelCommandExecutor {
     return this.monitorExecution(running, command, stdoutStream, stderrStream, stdout, stderr);
   }
 
-  private createStreams(
-    command: WorkspaceCommand,
-  ): {
+  private createStreams(command: WorkspaceCommand): {
     stdoutStream: PassThrough;
     stderrStream: PassThrough;
     stdout: Buffer[];
@@ -136,7 +134,7 @@ class VercelCommandExecutor {
   }
 
   private async monitorExecution(
-    running: Awaited<ReturnType<Sandbox["asUser"]>["runCommand"]>,
+    running: Command,
     command: WorkspaceCommand,
     stdoutStream: PassThrough,
     stderrStream: PassThrough,
@@ -191,10 +189,7 @@ class VercelCommandExecutor {
     };
   }
 
-  private async waitForCompletion(
-    running: Awaited<ReturnType<Sandbox["asUser"]>["runCommand"]>,
-    observation: AbortController,
-  ) {
+  private async waitForCompletion(running: Command, observation: AbortController) {
     let retries = 0;
     while (retries < MAX_RETRY_ATTEMPTS) {
       const timeout = AbortSignal.timeout(RETRY_TIMEOUT_MS);
@@ -225,30 +220,28 @@ export class VercelWorkspaceRuntime implements WorkspaceRuntime {
   private readonly sandboxManager: VercelSandboxManager;
   private readonly commandExecutor: VercelCommandExecutor;
 
-  constructor(
-    private readonly credentials?: { token: string; teamId: string; projectId: string },
-  ) {
+  constructor(credentials?: { token: string; teamId: string; projectId: string }) {
     this.sandboxManager = new VercelSandboxManager(credentials);
     this.commandExecutor = new VercelCommandExecutor();
   }
 
   async create(input: CreateWorkspace): Promise<WorkspaceHandle> {
     assertWorkspaceId(input.id);
+    const bootstrapCommand = workspaceBootstrapCommand(input);
     let startedCompute = false;
     const onStarted = async () => {
       startedCompute = true;
     };
     const sandbox = await this.sandboxManager.getOrCreate(input, onStarted);
-    const bootstrapCommand = workspaceBootstrapCommand(input);
     return this.initializeAndHandle(sandbox, input, bootstrapCommand, () => startedCompute);
   }
 
   async wake(workspace: WorkspaceLocator): Promise<WorkspaceHandle> {
+    const bootstrapCommand = workspaceBootstrapCommand(workspace);
     let startedCompute = false;
     const sandbox = await this.sandboxManager.get(workspace, true, async () => {
       startedCompute = true;
     });
-    const bootstrapCommand = workspaceBootstrapCommand(workspace);
     return this.initializeAndHandle(sandbox, workspace, bootstrapCommand, () => startedCompute);
   }
 
